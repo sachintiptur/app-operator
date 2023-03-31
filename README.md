@@ -1,2 +1,2 @@
 # app-operator
-Operator to manage application deployments
+A simple kubernetes operator to manage application deployments.
