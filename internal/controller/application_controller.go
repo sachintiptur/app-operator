@@ -19,7 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
-	"github.com/go-logr/logr"
+
 	simpleappv1 "github.com/sachintiptur/app-operator/api/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -36,13 +36,15 @@ import (
 
 const (
 	controllerName = "application-controller"
+	finalizerName  = "simpleapp.github.com/finalizer"
+	backendApp     = "backend"
+	frontendApp    = "frontend"
 )
 
-// ApplicationReconciler reconciles a Application object
+// ApplicationReconciler reconciles an Application object
 type ApplicationReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
-	Log    logr.Logger
 }
 
 //+kubebuilder:rbac:groups=simpleapp.github.com,resources=applications,verbs=get;list;watch;create;update;patch;delete
@@ -55,7 +57,7 @@ type ApplicationReconciler struct {
 // move the current state of the cluster closer to the desired state.
 
 func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := log.FromContext(ctx)
+	log := log.FromContext(ctx).WithValues(controllerName, req.NamespacedName)
 
 	log.Info("Reconciling application")
 
@@ -70,12 +72,9 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// handling finalizer
-	finalizerName := "simpleapp.github.com/finalizer"
-	//examine DeletionTimestamp to determine if object is under deletion
+	// examine DeletionTimestamp to determine if object is under deletion
 	if application.ObjectMeta.DeletionTimestamp.IsZero() {
 		if !controllerutil.ContainsFinalizer(application, finalizerName) {
-			fmt.Println("Adding finalizers")
 			controllerutil.AddFinalizer(application, finalizerName)
 			if err := r.Update(ctx, application); err != nil {
 				return ctrl.Result{}, err
@@ -84,13 +83,6 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	} else {
 		// The object is being deleted
 		if controllerutil.ContainsFinalizer(application, finalizerName) {
-			// our finalizer is present, so lets handle any external dependency
-			fmt.Println("in Deleting phase")
-			if err := r.deleteExternalResources(ctx, application); err != nil {
-				// if fail to delete the external dependency here, return with error
-				// so that it can be retried
-				return ctrl.Result{}, err
-			}
 			// remove our finalizer from the list and update it.
 			controllerutil.RemoveFinalizer(application, finalizerName)
 			if err := r.Update(ctx, application); err != nil {
@@ -100,33 +92,120 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 
-	if err := r.reconcile(ctx, &log, application); err != nil {
+	if err := r.reconcile(ctx, application); err != nil {
 		log.Error(err, "reconciling failed")
 	}
 
 	return ctrl.Result{}, nil
 }
 
-func (r *ApplicationReconciler) reconcile(ctx context.Context, log *logr.Logger, application *simpleappv1.Application) error {
-
-	r.ensureApplication(ctx, application)
+func (r *ApplicationReconciler) reconcile(ctx context.Context, application *simpleappv1.Application) error {
+	err := r.ensureApplication(ctx, application)
+	if err != nil {
+		log.Log.Error(err, "application reconciliation failed")
+		return err
+	}
 
 	return nil
-
 }
 
-func (r *ApplicationReconciler) createDeployment(ctx context.Context, service simpleappv1.ApplicationService) error {
+// ensureDeployment ensures that deployment is created/updated and in-sync with application spec
+func (r *ApplicationReconciler) ensureDeployment(ctx context.Context, application *simpleappv1.Application) error {
+	foundDeployment := &appsv1.Deployment{}
+	updateDeployment := false
 
+	for _, service := range application.Spec.Services {
+		err := r.Get(ctx, types.NamespacedName{
+			Name:      service.Name,
+			Namespace: application.Namespace,
+		}, foundDeployment)
+
+		if err != nil && errors.IsNotFound(err) {
+			log.Log.Info("Creating a new Deployment", service.Name, application.Namespace)
+
+			appDeployment, err := r.createDeploymentConfig(service, application)
+			if err != nil {
+				return err
+			}
+			if err := controllerutil.SetControllerReference(application, appDeployment, r.Scheme); err != nil {
+				return err
+			}
+			if err := r.Create(ctx, appDeployment); err != nil {
+				log.Log.Error(err, "creating deployment failed")
+				return err
+			}
+
+		} else {
+			if foundDeployment.Spec.Replicas != service.NumberOfEndpoints {
+				foundDeployment.Spec.Replicas = service.NumberOfEndpoints
+				updateDeployment = true
+			}
+			if foundDeployment.Spec.Template.Spec.Containers[0].Image != service.Image+service.Version {
+				foundDeployment.Spec.Template.Spec.Containers[0].Image = service.Image + service.Version
+				updateDeployment = true
+			}
+			if updateDeployment {
+				if err := r.Update(ctx, foundDeployment); err != nil {
+					return err
+				}
+			}
+		}
+
+	}
+	return nil
+}
+
+// ensureService ensures that service is created with given application spec
+func (r *ApplicationReconciler) ensureService(ctx context.Context, application *simpleappv1.Application) error {
+	found := &corev1.Service{}
+	for _, service := range application.Spec.Services {
+		err := r.Get(ctx, types.NamespacedName{
+			Name:      service.Name,
+			Namespace: application.Namespace,
+		}, found)
+
+		if err != nil && errors.IsNotFound(err) {
+			log.Log.Info("Creating a new Service", service.Name, application.Namespace)
+			service, err := r.createServiceConfig(service, application)
+			if err != nil {
+				return err
+			}
+
+			if err := controllerutil.SetControllerReference(application, service, r.Scheme); err != nil {
+				return err
+			}
+			if err := r.Create(ctx, service); err != nil {
+				log.Log.Error(err, "creating service failed")
+				return err
+			}
+
+		}
+	}
+	return nil
+}
+
+// createDeploymentConfig creates and returns the deployment config
+func (r *ApplicationReconciler) createDeploymentConfig(service simpleappv1.ApplicationService, application *simpleappv1.Application) (*appsv1.Deployment, error) {
 	labels := map[string]string{
-		"app": service.Name}
+		"app": service.Name,
+	}
 
 	appDeployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      service.Name,
 			Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: application.APIVersion,
+					UID:        application.UID,
+					Kind:       application.Kind,
+					Name:       application.Name,
+				},
+			},
 		},
+
 		Spec: appsv1.DeploymentSpec{
-			Replicas: &service.NumberOfEndpoints,
+			Replicas: service.NumberOfEndpoints,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: labels,
 			},
@@ -148,23 +227,28 @@ func (r *ApplicationReconciler) createDeployment(ctx context.Context, service si
 			},
 		},
 	}
-	log.Log.Info("creating deployment")
-	if err := r.Create(ctx, appDeployment); err != nil {
-		log.Log.Error(err, "creating deployment failed")
-		return err
-	}
 
-	return nil
+	return appDeployment, nil
 }
 
-func (r *ApplicationReconciler) createService(ctx context.Context, service simpleappv1.ApplicationService) error {
+// createServiceConfig creates and returns the service config
+func (r *ApplicationReconciler) createServiceConfig(service simpleappv1.ApplicationService, application *simpleappv1.Application) (*corev1.Service, error) {
 	labels := map[string]string{
-		"app": service.Name}
+		"app": service.Name,
+	}
 
-	srv := &corev1.Service{
+	serviceConfig := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      service.Name,
-			Namespace: "default",
+			Namespace: application.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: application.APIVersion,
+					UID:        application.UID,
+					Kind:       application.Kind,
+					Name:       application.Name,
+				},
+			},
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: labels,
@@ -176,93 +260,33 @@ func (r *ApplicationReconciler) createService(ctx context.Context, service simpl
 		},
 	}
 
-	if service.Type == "backend" {
-		srv.Spec.Type = corev1.ServiceTypeClusterIP
+	if service.Type == backendApp {
+		serviceConfig.Spec.Type = corev1.ServiceTypeClusterIP
+	} else if service.Type == frontendApp {
+		serviceConfig.Spec.Type = corev1.ServiceTypeNodePort
 	} else {
-		srv.Spec.Type = corev1.ServiceTypeNodePort
+		return nil, fmt.Errorf("unsupported type in application service spec")
 	}
 
-	log.Log.Info("creating service")
-	if err := r.Create(ctx, srv); err != nil {
-		log.Log.Error(err, "creating service failed")
-		return err
-	}
-
-	return nil
-
-}
-
-func updateApplicationDeployment(ctx context.Context, application *simpleappv1.Application) error {
-	return nil
+	return serviceConfig, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *ApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&simpleappv1.Application{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
 		Complete(r)
 }
 
+// ensureApplication ensures that application is created/updated and in-sync with application spec
 func (r *ApplicationReconciler) ensureApplication(ctx context.Context, application *simpleappv1.Application) error {
-
-	found := &appsv1.Deployment{}
-	var ownerReferences metav1.OwnerReference
-
-	for _, service := range application.Spec.Services {
-		err := r.Get(ctx, types.NamespacedName{
-			Name:      service.Name,
-			Namespace: "default"}, found)
-
-		if err != nil && errors.IsNotFound(err) {
-			// Create the application
-			log.Log.Info("Creating a new Application", "Application.Namespace", application.Namespace, "Deployment.Name", application.Name)
-			err = r.createDeployment(ctx, service)
-			if err != nil {
-				return err
-			}
-
-		} else {
-			ownerReferences = metav1.OwnerReference{
-				APIVersion: application.APIVersion,
-				UID:        application.UID,
-				Kind:       "Application",
-				Name:       application.Name,
-			}
-			found.OwnerReferences = append(found.OwnerReferences, ownerReferences)
-			if err = r.Update(ctx, found); err != nil {
-				log.Log.Error(err, "updating object failed")
-				return err
-			}
-		}
-		found := &corev1.Service{}
-		err = r.Get(ctx, types.NamespacedName{
-			Name:      service.Name,
-			Namespace: "default"}, found)
-
-		if err != nil && errors.IsNotFound(err) {
-			err = r.createService(ctx, service)
-			if err != nil {
-				return err
-			}
-		} else {
-			ownerReferences = metav1.OwnerReference{
-				APIVersion: application.APIVersion,
-				UID:        application.UID,
-				Kind:       "Application",
-				Name:       application.Name,
-			}
-			found.OwnerReferences = append(found.OwnerReferences, ownerReferences)
-			if err = r.Update(ctx, found); err != nil {
-				log.Log.Error(err, "deleting object failed")
-				return err
-			}
-
-		}
+	if err := r.ensureDeployment(ctx, application); err != nil {
+		return err
 	}
-	return nil
-}
-
-func (r *ApplicationReconciler) deleteExternalResources(ctx context.Context, application *simpleappv1.Application) error {
-
+	if err := r.ensureService(ctx, application); err != nil {
+		return err
+	}
 	return nil
 }

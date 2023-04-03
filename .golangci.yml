@@ -1,0 +1,22 @@
+---
+run:
+  timeout: 3m
+
+Rlinters:
+  enable:
+    - bodyclose
+    - contextcheck
+    - dupl
+    - gci
+    - goconst
+    - gocyclo
+    - goimports
+    - gofumpt
+    - revive
+    - gosec
+    - lll
+    - misspell
+    - nilerr
+    - prealloc
+    - unconvert
+    - whitespace

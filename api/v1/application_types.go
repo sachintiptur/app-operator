@@ -35,7 +35,7 @@ type ApplicationService struct {
 
 	// NumberOfEndpoints is number of pod replicas
 	//+kubebuilder:validation:Minimum=1
-	NumberOfEndpoints int32 `json:"numberofendpoints,omitempty"`
+	NumberOfEndpoints *int32 `json:"numberofendpoints,omitempty"`
 
 	// Image is the container image to pull
 	Image string `json:"image" required:"true"`
@@ -53,10 +53,7 @@ type ApplicationSpec struct {
 }
 
 // ApplicationStatus defines the observed state of Application
-type ApplicationStatus struct {
-	Status   string `json:"status,omitempty"`
-	Replicas int16  `json:"replicas,omitempty"`
-}
+type ApplicationStatus struct{}
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
