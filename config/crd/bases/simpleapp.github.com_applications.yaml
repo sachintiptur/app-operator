@@ -35,10 +35,14 @@ spec:
           spec:
             description: ApplicationSpec defines the desired state of Application
             properties:
+              grpcserver:
+                description: GrpcServer is grpc server address used by backend service
+                type: string
               name:
                 description: Name is a name of the Application that needs to be deployed
                 type: string
               services:
+                description: Services list of services need to be deployed
                 items:
                   properties:
                     image:

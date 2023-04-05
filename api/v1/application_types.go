@@ -48,8 +48,10 @@ type ApplicationService struct {
 type ApplicationSpec struct {
 	// Name is a name of the Application that needs to be deployed
 	Name string `json:"name,omitempty"`
-
+	// Services list of services need to be deployed
 	Services []ApplicationService `json:"services,omitempty"`
+	// GrpcServer is grpc server address used by backend service
+	GrpcServer string `json:"grpcserver,omitempty"`
 }
 
 // ApplicationStatus defines the observed state of Application

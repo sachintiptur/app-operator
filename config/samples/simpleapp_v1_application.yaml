@@ -11,11 +11,18 @@ metadata:
 spec:
   name: grpc-app
   services:
-  - name: backend-sats
-    port: 9000
-    type: "backend"
-    numberofendpoints: 2
-    image: ghcr.io/sachintiptur/backend
-    version: "satsv5"
+    - name: backend
+      port: 9000
+      type: "backend"
+      numberofendpoints: 2
+      image: ghcr.io/sachintiptur/backend
+      version: latest
+    - name: frontend
+      port: 8080
+      type: "frontend"
+      numberofendpoints: 1
+      image: ghcr.io/sachintiptur/frontend
+      version: latest
+  grpcserver: backend:9000
 
 

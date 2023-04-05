@@ -50,8 +50,10 @@ type ApplicationReconciler struct {
 //+kubebuilder:rbac:groups=simpleapp.github.com,resources=applications,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=simpleapp.github.com,resources=applications/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=simpleapp.github.com,resources=applications/finalizers,verbs=update
-//+kubebuilder:rbac:groups=simpleapp.github.com,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=simpleapp.github.com,resources=deployments/status,verbs=get
+//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
+//+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=services/status,verbs=get
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -105,7 +107,17 @@ func (r *ApplicationReconciler) reconcile(ctx context.Context, application *simp
 		log.Log.Error(err, "application reconciliation failed")
 		return err
 	}
+	return nil
+}
 
+// ensureApplication ensures that application is created/updated and in-sync with application spec
+func (r *ApplicationReconciler) ensureApplication(ctx context.Context, application *simpleappv1.Application) error {
+	if err := r.ensureDeployment(ctx, application); err != nil {
+		return err
+	}
+	if err := r.ensureService(ctx, application); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -127,6 +139,7 @@ func (r *ApplicationReconciler) ensureDeployment(ctx context.Context, applicatio
 			if err != nil {
 				return err
 			}
+			// set the controller reference to handle deployment as part of application object
 			if err := controllerutil.SetControllerReference(application, appDeployment, r.Scheme); err != nil {
 				return err
 			}
@@ -140,8 +153,8 @@ func (r *ApplicationReconciler) ensureDeployment(ctx context.Context, applicatio
 				foundDeployment.Spec.Replicas = service.NumberOfEndpoints
 				updateDeployment = true
 			}
-			if foundDeployment.Spec.Template.Spec.Containers[0].Image != service.Image+service.Version {
-				foundDeployment.Spec.Template.Spec.Containers[0].Image = service.Image + service.Version
+			if foundDeployment.Spec.Template.Spec.Containers[0].Image != service.Image+":"+service.Version {
+				foundDeployment.Spec.Template.Spec.Containers[0].Image = service.Image + ":" + service.Version
 				updateDeployment = true
 			}
 			if updateDeployment {
@@ -157,24 +170,26 @@ func (r *ApplicationReconciler) ensureDeployment(ctx context.Context, applicatio
 
 // ensureService ensures that service is created with given application spec
 func (r *ApplicationReconciler) ensureService(ctx context.Context, application *simpleappv1.Application) error {
-	found := &corev1.Service{}
+	foundService := &corev1.Service{}
+
 	for _, service := range application.Spec.Services {
 		err := r.Get(ctx, types.NamespacedName{
 			Name:      service.Name,
 			Namespace: application.Namespace,
-		}, found)
+		}, foundService)
 
 		if err != nil && errors.IsNotFound(err) {
 			log.Log.Info("Creating a new Service", service.Name, application.Namespace)
-			service, err := r.createServiceConfig(service, application)
+			serviceConfig, err := r.createServiceConfig(service, application)
 			if err != nil {
 				return err
 			}
 
-			if err := controllerutil.SetControllerReference(application, service, r.Scheme); err != nil {
+			// set the controller reference to handle service as part of application object
+			if err := controllerutil.SetControllerReference(application, serviceConfig, r.Scheme); err != nil {
 				return err
 			}
-			if err := r.Create(ctx, service); err != nil {
+			if err := r.Create(ctx, serviceConfig); err != nil {
 				log.Log.Error(err, "creating service failed")
 				return err
 			}
@@ -193,7 +208,7 @@ func (r *ApplicationReconciler) createDeploymentConfig(service simpleappv1.Appli
 	appDeployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      service.Name,
-			Namespace: "default",
+			Namespace: application.Namespace,
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: application.APIVersion,
@@ -214,18 +229,24 @@ func (r *ApplicationReconciler) createDeploymentConfig(service simpleappv1.Appli
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{
-						Image:           service.Image + ":" + service.Version,
-						ImagePullPolicy: corev1.PullAlways,
-						Name:            service.Name,
-						Ports: []corev1.ContainerPort{{
-							ContainerPort: service.Port,
-							Name:          service.Name,
-						}},
-					}},
+					Containers: []corev1.Container{
+						{
+							Image:           service.Image + ":" + service.Version,
+							ImagePullPolicy: corev1.PullAlways,
+							Name:            service.Name,
+							Ports: []corev1.ContainerPort{{
+								ContainerPort: service.Port,
+								Name:          service.Name,
+							}},
+						},
+					},
 				},
 			},
 		},
+	}
+	// configure GRPC_SERVER env for frontend service
+	if service.Type == frontendApp {
+		appDeployment.Spec.Template.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "GRPC_SERVER", Value: application.Spec.GrpcServer}}
 	}
 
 	return appDeployment, nil
@@ -263,7 +284,7 @@ func (r *ApplicationReconciler) createServiceConfig(service simpleappv1.Applicat
 	if service.Type == backendApp {
 		serviceConfig.Spec.Type = corev1.ServiceTypeClusterIP
 	} else if service.Type == frontendApp {
-		serviceConfig.Spec.Type = corev1.ServiceTypeNodePort
+		serviceConfig.Spec.Type = corev1.ServiceTypeLoadBalancer
 	} else {
 		return nil, fmt.Errorf("unsupported type in application service spec")
 	}
@@ -278,15 +299,4 @@ func (r *ApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Complete(r)
-}
-
-// ensureApplication ensures that application is created/updated and in-sync with application spec
-func (r *ApplicationReconciler) ensureApplication(ctx context.Context, application *simpleappv1.Application) error {
-	if err := r.ensureDeployment(ctx, application); err != nil {
-		return err
-	}
-	if err := r.ensureService(ctx, application); err != nil {
-		return err
-	}
-	return nil
 }
