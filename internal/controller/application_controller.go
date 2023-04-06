@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	simpleappv1 "github.com/sachintiptur/app-operator/api/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -74,15 +75,8 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// examine DeletionTimestamp to determine if object is under deletion
-	if application.ObjectMeta.DeletionTimestamp.IsZero() {
-		if !controllerutil.ContainsFinalizer(application, finalizerName) {
-			controllerutil.AddFinalizer(application, finalizerName)
-			if err := r.Update(ctx, application); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-	} else {
+	// Handle object deletion
+	if !application.ObjectMeta.DeletionTimestamp.IsZero() {
 		// The object is being deleted
 		if controllerutil.ContainsFinalizer(application, finalizerName) {
 			// remove our finalizer from the list and update it.
@@ -96,6 +90,14 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	if err := r.reconcile(ctx, application); err != nil {
 		log.Error(err, "reconciling failed")
+	}
+
+	// Add finalizer
+	if !controllerutil.ContainsFinalizer(application, finalizerName) {
+		controllerutil.AddFinalizer(application, finalizerName)
+		if err := r.Update(ctx, application); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	return ctrl.Result{}, nil
@@ -126,16 +128,16 @@ func (r *ApplicationReconciler) ensureDeployment(ctx context.Context, applicatio
 	foundDeployment := &appsv1.Deployment{}
 	updateDeployment := false
 
-	for _, service := range application.Spec.Services {
+	for _, component := range application.Spec.Components {
 		err := r.Get(ctx, types.NamespacedName{
-			Name:      service.Name,
+			Name:      component.Name,
 			Namespace: application.Namespace,
 		}, foundDeployment)
 
 		if err != nil && errors.IsNotFound(err) {
-			log.Log.Info("Creating a new Deployment", service.Name, application.Namespace)
+			log.Log.Info("Creating a new Deployment", component.Name, application.Namespace)
 
-			appDeployment, err := r.createDeploymentConfig(service, application)
+			appDeployment, err := r.createDeploymentConfig(component, application)
 			if err != nil {
 				return err
 			}
@@ -149,12 +151,12 @@ func (r *ApplicationReconciler) ensureDeployment(ctx context.Context, applicatio
 			}
 
 		} else {
-			if foundDeployment.Spec.Replicas != service.NumberOfEndpoints {
-				foundDeployment.Spec.Replicas = service.NumberOfEndpoints
+			if foundDeployment.Spec.Replicas != component.NumberOfEndpoints {
+				foundDeployment.Spec.Replicas = component.NumberOfEndpoints
 				updateDeployment = true
 			}
-			if foundDeployment.Spec.Template.Spec.Containers[0].Image != service.Image+":"+service.Version {
-				foundDeployment.Spec.Template.Spec.Containers[0].Image = service.Image + ":" + service.Version
+			if foundDeployment.Spec.Template.Spec.Containers[0].Image != component.Image+":"+component.Version {
+				foundDeployment.Spec.Template.Spec.Containers[0].Image = component.Image + ":" + component.Version
 				updateDeployment = true
 			}
 			if updateDeployment {
@@ -172,15 +174,15 @@ func (r *ApplicationReconciler) ensureDeployment(ctx context.Context, applicatio
 func (r *ApplicationReconciler) ensureService(ctx context.Context, application *simpleappv1.Application) error {
 	foundService := &corev1.Service{}
 
-	for _, service := range application.Spec.Services {
+	for _, component := range application.Spec.Components {
 		err := r.Get(ctx, types.NamespacedName{
-			Name:      service.Name,
+			Name:      component.Name,
 			Namespace: application.Namespace,
 		}, foundService)
 
 		if err != nil && errors.IsNotFound(err) {
-			log.Log.Info("Creating a new Service", service.Name, application.Namespace)
-			serviceConfig, err := r.createServiceConfig(service, application)
+			log.Log.Info("Creating a new Service", component.Name, application.Namespace)
+			serviceConfig, err := r.createServiceConfig(component, application)
 			if err != nil {
 				return err
 			}
@@ -199,15 +201,27 @@ func (r *ApplicationReconciler) ensureService(ctx context.Context, application *
 	return nil
 }
 
+// getGrpcServerAddress forms and returns the GRPC address string
+func (r *ApplicationReconciler) getGrpcServerAddress(application *simpleappv1.Application) string {
+	grpcAddress := ""
+	for _, component := range application.Spec.Components {
+		if component.Type == backendApp {
+			grpcAddress = component.Name + ":" + strconv.Itoa(int(component.Port))
+			break
+		}
+	}
+	return grpcAddress
+}
+
 // createDeploymentConfig creates and returns the deployment config
-func (r *ApplicationReconciler) createDeploymentConfig(service simpleappv1.ApplicationService, application *simpleappv1.Application) (*appsv1.Deployment, error) {
+func (r *ApplicationReconciler) createDeploymentConfig(component simpleappv1.ApplicationComponent, application *simpleappv1.Application) (*appsv1.Deployment, error) {
 	labels := map[string]string{
-		"app": service.Name,
+		"app": component.Name,
 	}
 
 	appDeployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      service.Name,
+			Name:      component.Name,
 			Namespace: application.Namespace,
 			OwnerReferences: []metav1.OwnerReference{
 				{
@@ -220,7 +234,7 @@ func (r *ApplicationReconciler) createDeploymentConfig(service simpleappv1.Appli
 		},
 
 		Spec: appsv1.DeploymentSpec{
-			Replicas: service.NumberOfEndpoints,
+			Replicas: component.NumberOfEndpoints,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: labels,
 			},
@@ -231,12 +245,12 @@ func (r *ApplicationReconciler) createDeploymentConfig(service simpleappv1.Appli
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Image:           service.Image + ":" + service.Version,
+							Image:           component.Image + ":" + component.Version,
 							ImagePullPolicy: corev1.PullAlways,
-							Name:            service.Name,
+							Name:            component.Name,
 							Ports: []corev1.ContainerPort{{
-								ContainerPort: service.Port,
-								Name:          service.Name,
+								ContainerPort: component.Port,
+								Name:          component.Name,
 							}},
 						},
 					},
@@ -245,22 +259,21 @@ func (r *ApplicationReconciler) createDeploymentConfig(service simpleappv1.Appli
 		},
 	}
 	// configure GRPC_SERVER env for frontend service
-	if service.Type == frontendApp {
-		appDeployment.Spec.Template.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "GRPC_SERVER", Value: application.Spec.GrpcServer}}
+	if component.Type == frontendApp {
+		appDeployment.Spec.Template.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "GRPC_SERVER", Value: r.getGrpcServerAddress(application)}}
 	}
-
 	return appDeployment, nil
 }
 
 // createServiceConfig creates and returns the service config
-func (r *ApplicationReconciler) createServiceConfig(service simpleappv1.ApplicationService, application *simpleappv1.Application) (*corev1.Service, error) {
+func (r *ApplicationReconciler) createServiceConfig(component simpleappv1.ApplicationComponent, application *simpleappv1.Application) (*corev1.Service, error) {
 	labels := map[string]string{
-		"app": service.Name,
+		"app": component.Name,
 	}
 
 	serviceConfig := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      service.Name,
+			Name:      component.Name,
 			Namespace: application.Namespace,
 			OwnerReferences: []metav1.OwnerReference{
 				{
@@ -275,15 +288,15 @@ func (r *ApplicationReconciler) createServiceConfig(service simpleappv1.Applicat
 			Selector: labels,
 			Ports: []corev1.ServicePort{{
 				Protocol:   corev1.ProtocolTCP,
-				Port:       service.Port,
-				TargetPort: intstr.FromInt(int(service.Port)),
+				Port:       component.Port,
+				TargetPort: intstr.FromInt(int(component.Port)),
 			}},
 		},
 	}
 
-	if service.Type == backendApp {
+	if component.Type == backendApp {
 		serviceConfig.Spec.Type = corev1.ServiceTypeClusterIP
-	} else if service.Type == frontendApp {
+	} else if component.Type == frontendApp {
 		serviceConfig.Spec.Type = corev1.ServiceTypeLoadBalancer
 	} else {
 		return nil, fmt.Errorf("unsupported type in application service spec")
