@@ -27,10 +27,10 @@ type ApplicationComponent struct {
 	// Port is server port that application starts on
 	Port int32 `json:"port,omitempty"`
 
-	// Type of service is either backend or frontend
+	// Type of component is either backend or frontend
 	// Valid values are:
-	// - backend: configures service type as ClusterIP
-	// - frontend: configures service type as NodePort
+	// - backend: configures component type as ClusterIP
+	// - frontend: configures component type as NodePort
 	Type string `json:"type,omitempty"`
 
 	// NumberOfEndpoints is number of pod replicas

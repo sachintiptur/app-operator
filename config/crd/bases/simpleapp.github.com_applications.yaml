@@ -57,9 +57,9 @@ spec:
                       format: int32
                       type: integer
                     type:
-                      description: 'Type of service is either backend or frontend
-                        Valid values are: - backend: configures service type as ClusterIP
-                        - frontend: configures service type as NodePort'
+                      description: 'Type of component is either backend or frontend
+                        Valid values are: - backend: configures component type as
+                        ClusterIP - frontend: configures component type as NodePort'
                       type: string
                     version:
                       description: Version is the application's version that need
